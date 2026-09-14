@@ -5,12 +5,16 @@
 // provider endpoints (not hardcoded to OpenAI's auth domain).
 
 import { randomBytes } from 'node:crypto'
+import dns from 'node:dns/promises'
 import { join } from 'node:path'
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http'
+import undici from 'undici'
 import { generatePKCE, buildAuthorizeUrl } from '../../auth/oauth.js'
 import { TokenStore, type TokenData } from '../../auth/token-store.js'
 import { shouldRefresh } from '../../auth/refresh.js'
 import { rivetHome } from '../../config/paths.js'
+import { resolveAndAssertPublic } from '../../tools/net/ssrf.js'
+import { buildPinnedLookup } from '../../tools/net/http-fetch.js'
 import type { McpOAuthProvider, McpOAuthToken } from './types.js'
 
 const REDIRECT_PORT = parseInt(process.env.RIVET_OAUTH_PORT || '1456', 10)
@@ -253,25 +257,61 @@ export async function serveCallback(
   })
 }
 
+async function postTokenRequest(endpoint: string, form: Record<string, string>): Promise<{
+  ok: boolean
+  status: number
+  text: string
+}> {
+  const url = new URL(endpoint)
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(`Unsupported OAuth token endpoint protocol: ${url.protocol}`)
+  }
+  const signal = AbortSignal.timeout(OAUTH_TIMEOUT_MS)
+  let abortLookup: () => void = () => {}
+  const deadline = new Promise<never>((_resolve, reject) => {
+    abortLookup = () => reject(signal.reason)
+    signal.addEventListener('abort', abortLookup, { once: true })
+    if (signal.aborted) abortLookup()
+  })
+  const resolved = await Promise.race([
+    resolveAndAssertPublic(url.hostname, dns.lookup), deadline,
+  ]).finally(() => signal.removeEventListener('abort', abortLookup))
+  signal.throwIfAborted()
+  // The callback is local; the provider's token endpoint must be public. Pin
+  // this credential-bearing request even when web-fetch pinning is disabled.
+  const dispatcher = new undici.Agent({
+    connect: { lookup: buildPinnedLookup(resolved.address, resolved.family) },
+  })
+  try {
+    // Match fetch and dispatcher versions; Node's builtin undici can differ.
+    const response = await undici.fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+      body: new URLSearchParams(form).toString(),
+      redirect: 'error',
+      dispatcher,
+      signal,
+    })
+    return { ok: response.ok, status: response.status, text: await response.text() }
+  } finally {
+    await dispatcher.destroy().catch(() => {})
+  }
+}
+
 async function exchange(
   code: string, codeVerifier: string, redirectUri: string,
   provider: McpOAuthProvider, clientId: string,
 ): Promise<TokenData> {
-  const resp = await fetch(provider.tokenEndpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
-    body: new URLSearchParams({
-      grant_type: 'authorization_code',
-      client_id: clientId,
-      code,
-      code_verifier: codeVerifier,
-      redirect_uri: redirectUri,
-    }).toString(),
-    signal: AbortSignal.timeout(OAUTH_TIMEOUT_MS),
+  const resp = await postTokenRequest(provider.tokenEndpoint, {
+    grant_type: 'authorization_code',
+    client_id: clientId,
+    code,
+    code_verifier: codeVerifier,
+    redirect_uri: redirectUri,
   })
 
   // GitHub returns form-encoded; others return JSON
-  const text = await resp.text()
+  const text = resp.text
   let data: Record<string, unknown>
   if (text.startsWith('{')) {
     data = JSON.parse(text) as Record<string, unknown>
@@ -301,18 +341,13 @@ async function refreshMcpToken(
 ): Promise<TokenData> {
   if (!token.refreshToken) throw new Error('No refresh token — re-authenticate')
 
-  const resp = await fetch(provider.tokenEndpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
-    body: new URLSearchParams({
-      grant_type: 'refresh_token',
-      client_id: clientId,
-      refresh_token: token.refreshToken,
-    }).toString(),
-    signal: AbortSignal.timeout(OAUTH_TIMEOUT_MS),
+  const resp = await postTokenRequest(provider.tokenEndpoint, {
+    grant_type: 'refresh_token',
+    client_id: clientId,
+    refresh_token: token.refreshToken,
   })
 
-  const text = await resp.text()
+  const text = resp.text
   let data: Record<string, unknown>
   if (text.startsWith('{')) {
     data = JSON.parse(text) as Record<string, unknown>
