@@ -1,5 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
+import dns from 'node:dns/promises'
+import undici from 'undici'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -114,7 +116,7 @@ describe('getMcpAccessToken', () => {
     clientIdHelp: '',
   }
 
-  it('refreshes an expired token and persists the new one', async () => {
+  it('refreshes an expired token and persists the new one', async t => {
     const serverId = 'refresh-test'
     const clientId = 'test-client'
 
@@ -126,11 +128,10 @@ describe('getMcpAccessToken', () => {
     }
     new TokenStore(join(testDir, 'mcp-oauth'), serverId).save(expired)
 
-    const origFetch = global.fetch
-    global.fetch = async () => ({
-      ok: true,
-      text: async () => 'access_token=new-token&refresh_token=refresh-456&expires_in=3600',
-    } as Response)
+    t.mock.method(dns, 'lookup', async () => ({ address: '93.184.216.34', family: 4 }))
+    t.mock.method(undici, 'fetch', async () => new undici.Response(
+      'access_token=new-token&refresh_token=refresh-456&expires_in=3600',
+    ))
 
     try {
       const accessToken = await getMcpAccessToken(serverId, provider as any, clientId)
@@ -140,7 +141,6 @@ describe('getMcpAccessToken', () => {
       assert.equal(stored?.refreshToken, 'refresh-456')
       assert.ok((stored?.expiresAt ?? 0) > Date.now(), 'new token should not be expired')
     } finally {
-      global.fetch = origFetch
       revokeMcpOAuth(serverId)
     }
   })
